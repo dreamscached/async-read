@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { EndOfStreamError } from "./errors.js";
 import { createReader, StreamReader } from "./reader.js";
 import { ReadableSource } from "./source.types.js";
 
@@ -22,6 +23,14 @@ export class MockReadableSource implements ReadableSource {
 			fn(payload);
 		}
 	}
+}
+
+/**
+ * Runs `trigger` once the reads are queued and waits for all of them to settle.
+ */
+async function settleAfter(reads: Promise<Uint8Array>[], trigger: () => void) {
+	trigger();
+	return Promise.allSettled(reads);
 }
 
 describe("StreamReader", () => {
@@ -139,6 +148,118 @@ describe("StreamReader", () => {
 			}, 5);
 			const result = await reader.read(3);
 			expect(result).toEqual(Uint8Array.from([1, 2, 3]));
+		});
+
+		it("rejects with an empty partial when the stream ends on a read boundary", async () => {
+			src.emit("end");
+			const error = await reader.read(1).catch((err: unknown) => err);
+			expect(error).toBeInstanceOf(EndOfStreamError);
+			expect((error as EndOfStreamError).partial).toEqual(new Uint8Array(0));
+		});
+
+		it("hands truncated data over in partial and removes it from the buffer", async () => {
+			src.emit("data", Uint8Array.from([1, 2]));
+			src.emit("end");
+			const error = await reader.read(3).catch((err: unknown) => err);
+			expect(error).toBeInstanceOf(EndOfStreamError);
+			expect((error as EndOfStreamError).partial).toEqual(Uint8Array.from([1, 2]));
+			expect(reader.buffered()).toBe(0);
+		});
+
+		it("settles every pending read when the stream ends", async () => {
+			const results = await settleAfter([reader.read(1), reader.read(1)], () =>
+				src.emit("end")
+			);
+			expect(results.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+		});
+
+		it("settles every pending read when the stream errors", async () => {
+			const failure = new Error("fail");
+			const results = await settleAfter([reader.read(1), reader.read(1)], () =>
+				src.emit("error", failure)
+			);
+			expect(results).toEqual([
+				{ status: "rejected", reason: failure },
+				{ status: "rejected", reason: failure }
+			]);
+		});
+
+		it("resolves every pending read a single chunk can satisfy", async () => {
+			const results = await settleAfter([reader.read(1), reader.read(1)], () =>
+				src.emit("data", Uint8Array.from([1, 2]))
+			);
+			expect(results).toEqual([
+				{ status: "fulfilled", value: Uint8Array.from([1]) },
+				{ status: "fulfilled", value: Uint8Array.from([2]) }
+			]);
+		});
+
+		it("does not let a later read overtake one still waiting for data", async () => {
+			const first = reader.read(2);
+			src.emit("data", Uint8Array.from([1]));
+			const second = reader.read(1);
+			src.emit("data", Uint8Array.from([2, 3]));
+			await expect(first).resolves.toEqual(Uint8Array.from([1, 2]));
+			await expect(second).resolves.toEqual(Uint8Array.from([3]));
+		});
+
+		it("serves buffered data before reporting a stream error", async () => {
+			src.emit("data", Uint8Array.from([1]));
+			src.emit("error", new Error("fail"));
+			await expect(reader.read(1)).resolves.toEqual(Uint8Array.from([1]));
+			await expect(reader.read(1)).rejects.toThrow("fail");
+		});
+	});
+
+	describe("readUpTo()", () => {
+		it("returns what is buffered when less than size is available", async () => {
+			src.emit("data", Uint8Array.from([1, 2]));
+			await expect(reader.readUpTo(5)).resolves.toEqual(Uint8Array.from([1, 2]));
+		});
+
+		it("returns at most size bytes and keeps the rest buffered", async () => {
+			src.emit("data", Uint8Array.from([1, 2, 3]));
+			await expect(reader.readUpTo(2)).resolves.toEqual(Uint8Array.from([1, 2]));
+			expect(reader.buffered()).toBe(1);
+		});
+
+		it("waits for data when the buffer is empty", async () => {
+			setTimeout(() => src.emit("data", Uint8Array.from([1])), 5);
+			await expect(reader.readUpTo(5)).resolves.toEqual(Uint8Array.from([1]));
+		});
+
+		it("returns an empty array at end of stream, every time", async () => {
+			src.emit("end");
+			await expect(reader.readUpTo(1)).resolves.toEqual(new Uint8Array(0));
+			await expect(reader.readUpTo(1)).resolves.toEqual(new Uint8Array(0));
+		});
+
+		it("drains buffered data before reporting end of stream", async () => {
+			src.emit("data", Uint8Array.from([1]));
+			src.emit("end");
+			await expect(reader.readUpTo(5)).resolves.toEqual(Uint8Array.from([1]));
+			await expect(reader.readUpTo(5)).resolves.toEqual(new Uint8Array(0));
+		});
+
+		it("rejects on stream error once buffered data is drained", async () => {
+			src.emit("data", Uint8Array.from([1]));
+			src.emit("error", new Error("fail"));
+			await expect(reader.readUpTo(5)).resolves.toEqual(Uint8Array.from([1]));
+			await expect(reader.readUpTo(5)).rejects.toThrow("fail");
+		});
+
+		it("queues behind a pending read", async () => {
+			const first = reader.read(2);
+			src.emit("data", Uint8Array.from([1]));
+			const second = reader.readUpTo(5);
+			src.emit("data", Uint8Array.from([2, 3]));
+			await expect(first).resolves.toEqual(Uint8Array.from([1, 2]));
+			await expect(second).resolves.toEqual(Uint8Array.from([3]));
+		});
+
+		it("validates size like read()", async () => {
+			await expect(reader.readUpTo(2.5)).rejects.toThrow("size must be an integer number");
+			await expect(reader.readUpTo(0)).rejects.toThrow("size must be a positive number");
 		});
 	});
 

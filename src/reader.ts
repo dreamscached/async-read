@@ -1,5 +1,15 @@
+import { EndOfStreamError } from "./errors.js";
 import { type PromiseSettleFunctions } from "./promise.types.js";
 import { type ReadableSource } from "./source.types.js";
+
+/**
+ * A read waiting in the queue for enough data to be settled.
+ */
+interface PendingRead {
+	size: number;
+	exact: boolean;
+	settle: PromiseSettleFunctions<Uint8Array>;
+}
 
 /**
  * Creates a new StreamReader instance for the given readable source.
@@ -16,13 +26,13 @@ export function createReader<T extends ReadableSource>(source: T) {
  * readable event-based stream (e.g., Node.js streams, custom event emitters).
  *
  * It collects `Uint8Array` chunks from a `ReadableSource` and enables consumers
- * to await exact byte sizes reliably.
+ * to await exact byte sizes reliably. Concurrent reads settle in the order they were made.
  */
 export class StreamReader<T extends ReadableSource> {
 	private _readBuffer = new Uint8Array(0);
 	private _endOfStream = false;
 	private _error: unknown = null;
-	private _callbacks: PromiseSettleFunctions<boolean>[] = [];
+	private _pending: PendingRead[] = [];
 
 	/**
 	 * Initializes a new StreamReader and subscribes to the source stream's events.
@@ -32,18 +42,18 @@ export class StreamReader<T extends ReadableSource> {
 	public constructor(source: T) {
 		source.on("data", (data) => {
 			this._writeToBuffer(data);
-			this._resolveReadPromise(true);
+			this._settlePending();
 		});
 
 		source.on("end", () => {
 			this._endOfStream = true;
-			this._resolveReadPromise(false);
+			this._settlePending();
 		});
 
 		source.on("error", (err) => {
 			this._error = err;
 			this._endOfStream = true;
-			this._rejectReadPromise(err);
+			this._settlePending();
 		});
 	}
 
@@ -55,21 +65,22 @@ export class StreamReader<T extends ReadableSource> {
 	 *
 	 * @param size - The number of bytes to read (must be a positive integer).
 	 * @returns A Uint8Array of the requested byte length.
-	 * @throws Error if `size` is invalid, or if the stream ends/errors before enough data arrives.
+	 * @throws Error if `size` is invalid, or if the stream errors before enough data arrives.
+	 * @throws EndOfStreamError if the stream ends before enough data arrives.
 	 */
 	public async read(size: number): Promise<Uint8Array> {
-		if (!Number.isInteger(size)) throw new Error("size must be an integer number");
-		if (size <= 0) throw new Error("size must be a positive number");
+		return this._enqueue(size, true);
+	}
 
-		while (this._readBuffer.length < size) {
-			const hasMore = await this._awaitBuffer();
-			if (!hasMore) throw new Error("end of stream");
-			await new Promise((resolve) => setTimeout(resolve, 0)); // yield
-		}
-
-		const result = this._readBuffer.subarray(0, size);
-		this._readBuffer = this._readBuffer.subarray(size);
-		return result;
+	/**
+	 * Reads at most `size` bytes, waiting only until at least one byte is available.
+	 *
+	 * @param size - The maximum number of bytes to read (must be a positive integer).
+	 * @returns A Uint8Array of 1 to `size` bytes, or an empty one if the stream has ended.
+	 * @throws Error if `size` is invalid, or if the stream errors before any data arrives.
+	 */
+	public async readUpTo(size: number): Promise<Uint8Array> {
+		return this._enqueue(size, false);
 	}
 
 	/**
@@ -94,45 +105,66 @@ export class StreamReader<T extends ReadableSource> {
 	}
 
 	/**
-	 * Resolves the next pending read promise with a flag indicating
-	 * whether more data may arrive.
+	 * Removes up to `size` bytes from the front of the internal read buffer.
 	 *
-	 * @param hasMore - `true` if more data may arrive; `false` if the stream has ended.
+	 * @param size - The number of bytes to remove.
+	 * @returns The removed bytes.
 	 */
-	private _resolveReadPromise(hasMore: boolean): void {
-		const cb = this._callbacks.shift();
-		if (cb !== undefined) {
-			const [resolve] = cb;
-			resolve(hasMore);
-		}
+	private _takeFromBuffer(size: number): Uint8Array {
+		const result = this._readBuffer.subarray(0, size);
+		this._readBuffer = this._readBuffer.subarray(size);
+		return result;
 	}
 
 	/**
-	 * Rejects the next pending read promise with the provided error.
+	 * Validates a read request and puts it at the back of the queue.
 	 *
-	 * @param err - The error that caused the stream to fail.
+	 * @param size - The requested number of bytes.
+	 * @param exact - `true` to require exactly `size` bytes; `false` to accept fewer.
+	 * @returns A promise settled once the read reaches the front of the queue and can complete.
 	 */
-	private _rejectReadPromise(err: unknown): void {
-		const cb = this._callbacks.shift();
-		if (cb !== undefined) {
-			const [, reject] = cb;
-			reject(err);
-		}
-	}
-
-	/**
-	 * Waits for new data to be buffered, the stream to end, or an error to occur.
-	 *
-	 * @returns A promise resolving to `true` if data may arrive, `false` if the stream ended.
-	 * @throws If the stream emits an error.
-	 */
-	private async _awaitBuffer(): Promise<boolean> {
-		if (this._error) throw this._error;
-		if (this._endOfStream) return false;
-		if (this._readBuffer.length > 0) return true;
+	private async _enqueue(size: number, exact: boolean): Promise<Uint8Array> {
+		if (!Number.isInteger(size)) throw new Error("size must be an integer number");
+		if (size <= 0) throw new Error("size must be a positive number");
 
 		return new Promise((resolve, reject) => {
-			this._callbacks.push([resolve, reject]);
+			this._pending.push({ size, exact, settle: [resolve, reject] });
+			this._settlePending();
 		});
+	}
+
+	/**
+	 * Settles queued reads from the front, stopping at the first one that has to keep waiting.
+	 */
+	private _settlePending(): void {
+		while (this._pending[0] !== undefined && this._trySettle(this._pending[0])) {
+			this._pending.shift();
+		}
+	}
+
+	/**
+	 * Settles a read if the buffered data and the stream state allow it.
+	 *
+	 * Buffered data is served before a stream error or end of stream is reported.
+	 *
+	 * @param read - The read to settle.
+	 * @returns `true` if the read was settled; `false` if it has to keep waiting.
+	 */
+	private _trySettle({ size, exact, settle: [resolve, reject] }: PendingRead): boolean {
+		const available = this._readBuffer.length;
+
+		if (available >= size || (!exact && available > 0)) {
+			resolve(this._takeFromBuffer(size));
+		} else if (!this._endOfStream) {
+			return false;
+		} else if (this._error !== null) {
+			reject(this._error);
+		} else if (exact) {
+			reject(new EndOfStreamError(this._takeFromBuffer(available)));
+		} else {
+			resolve(new Uint8Array(0));
+		}
+
+		return true;
 	}
 }
