@@ -64,7 +64,7 @@ export class StreamReader<T extends ReadableSource> {
 		while (this._readBuffer.length < size) {
 			const hasMore = await this._awaitBuffer();
 			if (!hasMore) throw new Error("end of stream");
-			await new Promise((resolve) => setInterval(resolve, 0)); // yield
+			await new Promise((resolve) => setTimeout(resolve, 0)); // yield
 		}
 
 		const result = this._readBuffer.subarray(0, size);

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createReader, StreamReader } from "./reader.js";
 import { ReadableSource } from "./source.types.js";
 
@@ -33,7 +33,20 @@ describe("StreamReader", () => {
 		reader = createReader(src);
 	});
 
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
 	describe("read()", () => {
+		it("leaves no timers pending after waiting for data", async () => {
+			vi.useFakeTimers();
+			const read = reader.read(2);
+			src.emit("data", Uint8Array.from([1, 2]));
+			await vi.advanceTimersByTimeAsync(1);
+			await expect(read).resolves.toEqual(Uint8Array.from([1, 2]));
+			expect(vi.getTimerCount()).toBe(0);
+		});
+
 		it("reads buffered data from a single chunk", async () => {
 			src.emit("data", Uint8Array.from([1, 2, 3]));
 			const result = await reader.read(3);
